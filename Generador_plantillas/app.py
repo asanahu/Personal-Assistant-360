@@ -15,6 +15,10 @@ import shutil
 import time
 import json
 import sqlite3
+import requests
+import html
+import re
+from markupsafe import Markup
 # Obtiene el directorio actual donde está app.py
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 # Asegurar que el directorio raíz del proyecto está en sys.path
@@ -39,6 +43,13 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+try:
+    N8N_WEBHOOK_TIMEOUT = int(os.getenv("N8N_WEBHOOK_TIMEOUT", "60"))
+    if N8N_WEBHOOK_TIMEOUT <= 0:
+        N8N_WEBHOOK_TIMEOUT = 60
+except ValueError:
+    N8N_WEBHOOK_TIMEOUT = 60
 
 # Configuración del directorio de carga de archivos
 UPLOAD_FOLDER = 'uploads'
@@ -54,7 +65,8 @@ def index():
         # Guardar en la sesión
         session["nombre"] = nombre
         session["puesto"] = puesto
-
+        if puesto == "Supervisor" and nombre.strip().lower() == "asanahuja":
+            return redirect(url_for("interaccion_supervisor_webhook"))
         return redirect(url_for("interaccion_llm"))
     return render_template("index.html")
 
@@ -78,6 +90,8 @@ def interaccion_llm():
 
     nombre = session["nombre"]
     puesto = session["puesto"]
+    if puesto == "Supervisor" and nombre.strip().lower() == "asanahuja":
+        return redirect(url_for("interaccion_supervisor_webhook"))
     respuesta = None
 
     if request.method == "POST":
@@ -149,6 +163,185 @@ def interaccion_llm():
         # registrar_mensaje(nombre, puesto, pregunta, respuesta)
 
     return render_template("interaccion_llm.html", nombre=nombre, puesto=puesto, respuesta=respuesta)
+
+
+def format_webhook_response(payload, fallback_text=None):
+    """Devuelve HTML agradable para una respuesta del webhook."""
+    raw = payload if payload is not None else fallback_text
+
+    if isinstance(raw, dict):
+        text_candidate = None
+        for key in ("respuesta", "output", "message", "result"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                text_candidate = value
+                break
+        if text_candidate is None and len(raw) == 1:
+            only_value = next(iter(raw.values()))
+            if isinstance(only_value, str):
+                text_candidate = only_value
+        if text_candidate is None:
+            try:
+                escaped = html.escape(json.dumps(raw, indent=2, ensure_ascii=False))
+            except TypeError:
+                escaped = html.escape(str(raw))
+            return Markup(f"<pre class='mb-0'>{escaped}</pre>")
+        return Markup(_markdownish_to_html(text_candidate))
+
+    if isinstance(raw, (list, tuple)):
+        escaped = html.escape(json.dumps(raw, indent=2, ensure_ascii=False))
+        return Markup(f"<pre class='mb-0'>{escaped}</pre>")
+
+    if raw is None:
+        return None
+
+    raw_str = str(raw).strip()
+    if raw_str.startswith("{") and raw_str.endswith("}"):
+        try:
+            parsed = json.loads(raw_str)
+            return format_webhook_response(parsed, raw_str)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if raw_str.startswith("[") and raw_str.endswith("]"):
+        try:
+            parsed = json.loads(raw_str)
+            return format_webhook_response(parsed, raw_str)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return Markup(_markdownish_to_html(raw_str))
+
+
+def _markdownish_to_html(text):
+    escaped_text = html.escape(text)
+    lines = escaped_text.splitlines()
+    html_parts = []
+    in_list = False
+
+    def apply_inline(content):
+        content = re.sub(
+            r"(https?://[^\s<]+)",
+            lambda match: f"<a href='{match.group(1)}' target='_blank' rel='noopener'>{match.group(1)}</a>",
+            content
+        )
+        content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
+        content = re.sub(r"`(.+?)`", r"<code class='bg-body-secondary px-1 rounded'>\1</code>", content)
+        return content
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append("<div class='mb-2'></div>")
+            continue
+
+        heading_match = re.match(r"^(#{2,4})\s+(.*)", stripped)
+        if heading_match:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            level = min(len(heading_match.group(1)), 4)
+            content = apply_inline(heading_match.group(2).strip())
+            html_parts.append(f"<h{level} class='fw-semibold text-primary-emphasis mt-3 mb-2'>{content}</h{level}>")
+            continue
+
+        if stripped.startswith("- "):
+            if not in_list:
+                html_parts.append("<ul class='list-unstyled ps-3 mb-2'>")
+                in_list = True
+            content = apply_inline(stripped[2:].strip())
+            html_parts.append(f"<li class='mb-1'>{content}</li>")
+            continue
+
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+
+        content = apply_inline(stripped)
+        html_parts.append(f"<p class='mb-2'>{content}</p>")
+
+    if in_list:
+        html_parts.append("</ul>")
+
+    return "".join(html_parts)
+
+
+@app.route("/interaccion_supervisor_webhook", methods=["GET", "POST"])
+def interaccion_supervisor_webhook():
+    if "nombre" not in session or "puesto" not in session:
+        return redirect(url_for("index"))
+
+    nombre = session["nombre"]
+    puesto = session["puesto"]
+
+    if puesto != "Supervisor" or nombre.strip().lower() != "asanahuja":
+        flash("No tienes acceso a esta secci\u00f3n.", "error")
+        return redirect(url_for("interaccion_llm"))
+
+    respuesta = None
+    respuesta_html = None
+    consulta_enviada = None
+
+    if request.method == "POST":
+        pregunta = request.form["pregunta"]
+        consulta_enviada = pregunta
+
+        if not N8N_WEBHOOK_URL:
+            respuesta = "El webhook de n8n no est\u00e1 configurado. Define la variable de entorno N8N_WEBHOOK_URL."
+            respuesta_html = format_webhook_response(respuesta)
+        else:
+            payload = {
+                "usuario": nombre,
+                "puesto": puesto,
+                "consulta": pregunta,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            try:
+                webhook_response = requests.post(
+                    N8N_WEBHOOK_URL,
+                    json=payload,
+                    timeout=N8N_WEBHOOK_TIMEOUT
+                )
+                webhook_response.raise_for_status()
+
+                try:
+                    data = webhook_response.json()
+                except ValueError:
+                    data = webhook_response.text
+
+                raw_response = data
+                if isinstance(data, dict):
+                    respuesta = data.get("respuesta") or json.dumps(data, indent=2, ensure_ascii=False)
+                elif isinstance(data, (list, tuple)):
+                    respuesta = json.dumps(data, indent=2, ensure_ascii=False)
+                else:
+                    respuesta = str(data).strip() or "El webhook no devolvi\u00f3 contenido."
+
+                respuesta_html = format_webhook_response(raw_response, respuesta)
+
+            except requests.exceptions.Timeout:
+                respuesta = (
+                    "El webhook de n8n no respondi\u00f3 a tiempo. "
+                    f"Verifica el flujo o incrementa el tiempo de espera configurando N8N_WEBHOOK_TIMEOUT (actual: {N8N_WEBHOOK_TIMEOUT} segundos)."
+                )
+                respuesta_html = format_webhook_response(respuesta)
+            except requests.exceptions.RequestException as exc:
+                respuesta = f"Error al contactar el webhook de n8n: {exc}"
+                respuesta_html = format_webhook_response(respuesta)
+
+        registrar_mensaje_mongo(nombre, puesto, pregunta, respuesta)
+
+    return render_template(
+        "interaccion_supervisor_webhook.html",
+        nombre=nombre,
+        puesto=puesto,
+        respuesta=respuesta,
+        respuesta_html=respuesta_html,
+        consulta_enviada=consulta_enviada
+    )
 
 
 @app.route("/plantillas_csr", methods=["GET", "POST"])
