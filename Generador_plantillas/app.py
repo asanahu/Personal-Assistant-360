@@ -18,6 +18,7 @@ import sqlite3
 import requests
 import html
 import re
+import logging
 from markupsafe import Markup
 # Obtiene el directorio actual donde está app.py
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -42,6 +43,7 @@ load_dotenv()
 # Configuración básica
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+app.logger.setLevel(logging.INFO)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 try:
@@ -59,13 +61,15 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        nombre = request.form["nombre"]
-        puesto = request.form["puesto"]
+        nombre = request.form["nombre"].strip()
+        puesto = request.form["puesto"].strip()
+        is_supervisor = puesto.lower() == "supervisor" and nombre.lower() == "asanahuja"
+        app.logger.info("Login attempt - nombre=%r, puesto=%r, supervisor_mode=%s", nombre, puesto, is_supervisor)
 
         # Guardar en la sesión
         session["nombre"] = nombre
         session["puesto"] = puesto
-        if puesto == "Supervisor" and nombre.strip().lower() == "asanahuja":
+        if is_supervisor:
             return redirect(url_for("interaccion_supervisor_webhook"))
         return redirect(url_for("interaccion_llm"))
     return render_template("index.html")
@@ -90,7 +94,7 @@ def interaccion_llm():
 
     nombre = session["nombre"]
     puesto = session["puesto"]
-    if puesto == "Supervisor" and nombre.strip().lower() == "asanahuja":
+    if puesto.strip().lower() == "supervisor" and nombre.strip().lower() == "asanahuja":
         return redirect(url_for("interaccion_supervisor_webhook"))
     respuesta = None
 
