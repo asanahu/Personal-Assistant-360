@@ -1,5 +1,5 @@
 /* Estilo del cuerpo */
-body {
+body:not(.page-bg) {
     display: flex; /* Flexbox para centrar */
     justify-content: center; /* Centra horizontalmente */
     align-items: center; /* Centra verticalmente */

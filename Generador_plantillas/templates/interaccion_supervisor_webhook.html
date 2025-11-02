@@ -8,7 +8,11 @@
     <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
     <style>
         body.page-bg {
+            margin: 0;
             min-height: 100vh;
+            display: block;
+            height: auto;
+            overflow-y: auto;
             background: radial-gradient(circle at top, #1d4ed8 0%, #111827 45%, #030712 100%);
             color: #e2e8f0;
         }
